@@ -16,6 +16,11 @@ import hmac
 import secrets
 import time
 from datetime import datetime, timedelta
+import shutil
+import glob
+import io
+import zipfile
+import json
 
 # Set a constant secure key for password verification (don't change this after setup)
 # In production, you would store this in an environment variable or secret manager
@@ -139,173 +144,175 @@ def change_password_ui():
             conn.close()
             st.error("Current password is incorrect.")
 
-# Initialize authentication
-init_auth()
+# ============= BACKUP FUNCTIONS =============
 
-# Check authentication before proceeding
-check_auth()
+def setup_auto_backup():
+    """Setup automatic backup system for the database"""
+    # Create backups directory if it doesn't exist
+    if not os.path.exists('backups'):
+        os.makedirs('backups')
+    
+    # Check when the last backup was made
+    conn = sqlite3.connect('timesheet_data.db')
+    c = conn.cursor()
+    
+    # Create backup_logs table if it doesn't exist
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS backup_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        backup_date TIMESTAMP,
+        backup_path TEXT,
+        backup_type TEXT
+    )
+    ''')
+    
+    # Check the last backup date
+    c.execute("SELECT MAX(backup_date) FROM backup_logs WHERE backup_type = 'auto'")
+    last_backup = c.fetchone()[0]
+    
+    # Convert to datetime if not None
+    if last_backup:
+        last_backup = datetime.strptime(last_backup, '%Y-%m-%d %H:%M:%S')
+    
+    # If no backup in the last 24 hours, create one
+    if not last_backup or (datetime.now() - last_backup) > timedelta(hours=24):
+        # Create backup filename with timestamp
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        backup_path = f"backups/timesheet_backup_{timestamp}.db"
+        
+        # Close the connection to make a clean copy
+        conn.close()
+        
+        # Copy the database file
+        shutil.copy2('timesheet_data.db', backup_path)
+        
+        # Reopen connection
+        conn = sqlite3.connect('timesheet_data.db')
+        c = conn.cursor()
+        
+        # Log the backup
+        c.execute("""
+        INSERT INTO backup_logs (backup_date, backup_path, backup_type) 
+        VALUES (?, ?, ?)
+        """, (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), backup_path, 'auto'))
+        
+        # Keep only the last 30 auto backups
+        c.execute("SELECT backup_path FROM backup_logs WHERE backup_type = 'auto' ORDER BY backup_date DESC LIMIT 30")
+        keep_backups = [row[0] for row in c.fetchall()]
+        
+        c.execute("SELECT backup_path FROM backup_logs WHERE backup_type = 'auto' ORDER BY backup_date DESC")
+        all_backups = [row[0] for row in c.fetchall()]
+        
+        # Delete old backups
+        for backup in all_backups:
+            if backup not in keep_backups and os.path.exists(backup):
+                try:
+                    os.remove(backup)
+                    c.execute("DELETE FROM backup_logs WHERE backup_path = ?", (backup,))
+                except:
+                    pass  # Skip if file is in use or can't be deleted
+        
+    conn.commit()
+    conn.close()
 
-# Apply custom CSS for modern Ant Design-like styling
-st.markdown("""
-<style>
-    /* General styling */
-    .main .block-container {
-        padding-top: 2rem;
-        padding-bottom: 2rem;
-    }
+def create_manual_backup():
+    """Create a manual backup of the database"""
+    # Create backups directory if it doesn't exist
+    if not os.path.exists('backups'):
+        os.makedirs('backups')
+    
+    # Create backup filename with timestamp
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    backup_path = f"backups/timesheet_manual_backup_{timestamp}.db"
+    
+    # Copy the database file
+    shutil.copy2('timesheet_data.db', backup_path)
+    
+    # Log the backup
+    conn = sqlite3.connect('timesheet_data.db')
+    c = conn.cursor()
+    c.execute("""
+    INSERT INTO backup_logs (backup_date, backup_path, backup_type) 
+    VALUES (?, ?, ?)
+    """, (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), backup_path, 'manual'))
+    conn.commit()
+    conn.close()
+    
+    return backup_path
 
-    /* Titles and headers */
-    h1, h2, h3, h4, h5, h6 {
-        color: #1f1f1f !important;
-        font-family: 'Inter', sans-serif;
-    }
+def get_available_backups():
+    """Get a list of all available backups"""
+    conn = sqlite3.connect('timesheet_data.db')
+    c = conn.cursor()
+    
+    # Check if table exists
+    c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='backup_logs'")
+    if not c.fetchone():
+        conn.close()
+        return pd.DataFrame()  # Return empty dataframe if table doesn't exist
+    
+    df = pd.read_sql_query("""
+    SELECT 
+        id,
+        backup_date, 
+        backup_path,
+        backup_type,
+        CASE 
+            WHEN backup_type = 'auto' THEN 'Automatic' 
+            WHEN backup_type = 'manual' THEN 'Manual'
+            ELSE backup_type
+        END as backup_type_display
+    FROM backup_logs 
+    ORDER BY backup_date DESC
+    """, conn)
+    conn.close()
+    return df
 
-    h1 {
-        font-size: 32px !important;
-        font-weight: 600 !important;
-    }
+def restore_from_backup(backup_path):
+    """Restore the database from a backup file"""
+    # First create a backup of the current state
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    pre_restore_backup = f"backups/pre_restore_backup_{timestamp}.db"
+    
+    # Create backups directory if it doesn't exist
+    if not os.path.exists('backups'):
+        os.makedirs('backups')
+    
+    # Copy current database to pre-restore backup
+    shutil.copy2('timesheet_data.db', pre_restore_backup)
+    
+    # Log the pre-restore backup
+    conn = sqlite3.connect('timesheet_data.db')
+    c = conn.cursor()
+    c.execute("""
+    INSERT INTO backup_logs (backup_date, backup_path, backup_type) 
+    VALUES (?, ?, ?)
+    """, (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), pre_restore_backup, 'pre-restore'))
+    conn.commit()
+    conn.close()
+    
+    # Copy the backup file to the main database file
+    try:
+        shutil.copy2(backup_path, 'timesheet_data.db')
+        return True
+    except Exception as e:
+        return str(e)
 
-    h2 {
-        font-size: 24px !important;
-        font-weight: 500 !important;
-    }
-
-    h3 {
-        font-size: 20px !important;
-        font-weight: 500 !important;
-    }
-
-    /* Buttons */
-    .stButton > button {
-        background-color: #1890ff !important;
-        color: white !important;
-        border-radius: 6px !important;
-        border: none !important;
-        padding: 8px 16px !important;
-        font-size: 14px !important;
-        font-weight: 500 !important;
-        transition: background-color 0.2s ease;
-    }
-
-    .stButton > button:hover {
-        background-color: #40a9ff !important;
-    }
-
-    /* Input fields */
-    .stTextInput > div > div > input,
-    .stNumberInput > div > div > input,
-    .stDateInput > div > div > input,
-    .stTextArea > div > div > textarea {
-        border: 1px solid #d9d9d9 !important;
-        border-radius: 6px !important;
-        padding: 8px 12px !important;
-        font-size: 14px !important;
-    }
-
-    .stTextInput > div > div > input:focus,
-    .stNumberInput > div > div > input:focus,
-    .stDateInput > div > div > input:focus,
-    .stTextArea > div > div > textarea:focus {
-        border-color: #40a9ff !important;
-        box-shadow: 0 0 0 2px rgba(24, 144, 255, 0.2) !important;
-    }
-
-    /* Tabs */
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 8px !important;
-        border-bottom: 1px solid #f0f0f0 !important;
-    }
-
-    .stTabs [data-baseweb="tab"] {
-        padding: 8px 16px !important;
-        font-size: 14px !important;
-        font-weight: 500 !important;
-        color: #595959 !important;
-        background-color: transparent !important;
-        border-radius: 6px 6px 0 0 !important;
-        transition: all 0.2s ease;
-    }
-
-    .stTabs [aria-selected="true"] {
-        color: #1890ff !important;
-        border-bottom: 2px solid #1890ff !important;
-    }
-
-    .stTabs [data-baseweb="tab"]:hover {
-        color: #40a9ff !important;
-    }
-
-    /* Cards (for reporting metrics) */
-    .reporting-card {
-        background-color: white !important;
-        border: 1px solid #f0f0f0 !important;
-        border-radius: 8px !important;
-        padding: 16px !important;
-        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05) !important;
-    }
-
-    .reporting-card h4 {
-        font-size: 16px !important;
-        color: #595959 !important;
-        margin-bottom: 8px !important;
-    }
-
-    .summary-metric {
-        font-size: 24px !important;
-        font-weight: 600 !important;
-        color: #1f1f1f !important;
-    }
-
-    /* Tables */
-    .stDataFrame {
-        border-radius: 8px !important;
-        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05) !important;
-    }
-
-    .stDataFrame th {
-        background-color: #fafafa !important;
-        font-weight: 500 !important;
-        color: #1f1f1f !important;
-    }
-
-    .stDataFrame td {
-        border-bottom: 1px solid #f0f0f0 !important;
-    }
-
-    /* Status badges */
-    .status-approved {
-        color: #52c41a !important;
-        font-weight: 500 !important;
-    }
-
-    .status-pending {
-        color: #faad14 !important;
-        font-weight: 500 !important;
-    }
-
-    .status-rejected {
-        color: #ff4d4f !important;
-        font-weight: 500 !important;
-    }
-
-    /* Custom file uploader */
-    .custom-file-selector input {
-        display: none !important;
-    }
-
-    /* Danger zone (reset database) */
-    .stWarning {
-        background-color: #fff1f0 !important;
-        border: 1px solid #ffccc7 !important;
-        border-radius: 8px !important;
-        padding: 16px !important;
-    }
-
-    .stWarning p {
-        color: #ff4d4f !important;
-    }
-</style>
-""", unsafe_allow_html=True)
+def create_backup_zip():
+    """Create a zip file containing all backups"""
+    memory_file = io.BytesIO()
+    
+    with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
+        # Add the current database
+        zf.write('timesheet_data.db', 'current_timesheet_data.db')
+        
+        # Add all backups
+        if os.path.exists('backups'):
+            for backup_file in glob.glob('backups/*.db'):
+                zf.write(backup_file, os.path.basename(backup_file))
+    
+    memory_file.seek(0)
+    return memory_file
 
 # Initialize database
 def init_db():
@@ -562,6 +569,177 @@ def get_download_link(buffer, filename, text):
 
 # Initialize the database
 init_db()
+
+# Setup automatic backup system
+setup_auto_backup()
+
+# Initialize authentication
+init_auth()
+
+# Check authentication before proceeding
+check_auth()
+
+# Apply custom CSS for modern Ant Design-like styling
+st.markdown("""
+<style>
+    /* General styling */
+    .main .block-container {
+        padding-top: 2rem;
+        padding-bottom: 2rem;
+    }
+
+    /* Titles and headers */
+    h1, h2, h3, h4, h5, h6 {
+        color: #1f1f1f !important;
+        font-family: 'Inter', sans-serif;
+    }
+
+    h1 {
+        font-size: 32px !important;
+        font-weight: 600 !important;
+    }
+
+    h2 {
+        font-size: 24px !important;
+        font-weight: 500 !important;
+    }
+
+    h3 {
+        font-size: 20px !important;
+        font-weight: 500 !important;
+    }
+
+    /* Buttons */
+    .stButton > button {
+        background-color: #1890ff !important;
+        color: white !important;
+        border-radius: 6px !important;
+        border: none !important;
+        padding: 8px 16px !important;
+        font-size: 14px !important;
+        font-weight: 500 !important;
+        transition: background-color 0.2s ease;
+    }
+
+    .stButton > button:hover {
+        background-color: #40a9ff !important;
+    }
+
+    /* Input fields */
+    .stTextInput > div > div > input,
+    .stNumberInput > div > div > input,
+    .stDateInput > div > div > input,
+    .stTextArea > div > div > textarea {
+        border: 1px solid #d9d9d9 !important;
+        border-radius: 6px !important;
+        padding: 8px 12px !important;
+        font-size: 14px !important;
+    }
+
+    .stTextInput > div > div > input:focus,
+    .stNumberInput > div > div > input:focus,
+    .stDateInput > div > div > input:focus,
+    .stTextArea > div > div > textarea:focus {
+        border-color: #40a9ff !important;
+        box-shadow: 0 0 0 2px rgba(24, 144, 255, 0.2) !important;
+    }
+
+    /* Tabs */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px !important;
+        border-bottom: 1px solid #f0f0f0 !important;
+    }
+
+    .stTabs [data-baseweb="tab"] {
+        padding: 8px 16px !important;
+        font-size: 14px !important;
+        font-weight: 500 !important;
+        color: #595959 !important;
+        background-color: transparent !important;
+        border-radius: 6px 6px 0 0 !important;
+        transition: all 0.2s ease;
+    }
+
+    .stTabs [aria-selected="true"] {
+        color: #1890ff !important;
+        border-bottom: 2px solid #1890ff !important;
+    }
+
+    .stTabs [data-baseweb="tab"]:hover {
+        color: #40a9ff !important;
+    }
+
+    /* Cards (for reporting metrics) */
+    .reporting-card {
+        background-color: white !important;
+        border: 1px solid #f0f0f0 !important;
+        border-radius: 8px !important;
+        padding: 16px !important;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05) !important;
+    }
+
+    .reporting-card h4 {
+        font-size: 16px !important;
+        color: #595959 !important;
+        margin-bottom: 8px !important;
+    }
+
+    .summary-metric {
+        font-size: 24px !important;
+        font-weight: 600 !important;
+        color: #1f1f1f !important;
+    }
+
+    /* Tables */
+    .stDataFrame {
+        border-radius: 8px !important;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05) !important;
+    }
+
+    .stDataFrame th {
+        background-color: #fafafa !important;
+        font-weight: 500 !important;
+        color: #1f1f1f !important;
+    }
+
+    .stDataFrame td {
+        border-bottom: 1px solid #f0f0f0 !important;
+    }
+
+    /* Status badges */
+    .status-approved {
+        color: #52c41a !important;
+        font-weight: 500 !important;
+    }
+
+    .status-pending {
+        color: #faad14 !important;
+        font-weight: 500 !important;
+    }
+
+    .status-rejected {
+        color: #ff4d4f !important;
+        font-weight: 500 !important;
+    }
+
+    /* Custom file uploader */
+    .custom-file-selector input {
+        display: none !important;
+    }
+
+    /* Danger zone (reset database) */
+    .stWarning {
+        background-color: #fff1f0 !important;
+        border: 1px solid #ffccc7 !important;
+        border-radius: 8px !important;
+        padding: 16px !important;
+    }
+
+    .stWarning p {
+        color: #ff4d4f !important;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # App title and description
 st.title("⏱️ Team Timesheet Tracker")
@@ -966,6 +1144,7 @@ with tabs[2]:  # Team Management Tab
                         
                         st.write(f"**Notes:** {entry['notes'] if pd.notna(entry['notes']) else ''}")
                         st.markdown("---")
+
 with tabs[3]:  # Settings Tab
     st.header("Settings")
 
@@ -973,30 +1152,124 @@ with tabs[3]:  # Settings Tab
     st.subheader("Change Password")
     change_password_ui()
 
-    # Database Backup Section
-    st.subheader("Database Backup")
-    st.info("Download a backup of the current database.")
-    
-    if st.button("Download Database Backup"):
-        conn = sqlite3.connect('timesheet_data.db')
-        backup_data = BytesIO()
-        backup_data.write(conn.iterdump().encode('utf-8'))
-        backup_data.seek(0)
-        conn.close()
+    # Database Backup & Restore Section
+    st.subheader("Database Backup & Restore")
+
+    backup_tabs = st.tabs(["Backup", "Restore", "Backup History"])
+
+    with backup_tabs[0]:  # Backup tab
+        st.info("Create a backup of your timesheet database or download all backups.")
         
-        st.markdown(
-            get_download_link(backup_data, "timesheet_backup.sql", "📥 Download Database Backup"),
-            unsafe_allow_html=True
-        )
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("Create Manual Backup", key="create_manual_backup"):
+                backup_path = create_manual_backup()
+                st.success(f"Backup created successfully at: {backup_path}")
+        
+        with col2:
+            if st.button("Download All Backups as ZIP", key="download_all_backups"):
+                backup_zip = create_backup_zip()
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                st.markdown(
+                    get_download_link(backup_zip, f"timesheet_all_backups_{timestamp}.zip", "📥 Download All Backups"),
+                    unsafe_allow_html=True
+                )
+
+    with backup_tabs[1]:  # Restore tab
+        st.warning("⚠️ Restoring from a backup will replace all current data with the backup's data.")
+        st.info("Before restoring, a backup of the current state will be created automatically.")
+        
+        # Get available backups
+        backups = get_available_backups()
+        
+        if backups.empty:
+            st.warning("No backups available for restore.")
+        else:
+            # Display available backups
+            st.write("Available Backups:")
+            
+            # Format the backup date for display
+            backups['display_date'] = pd.to_datetime(backups['backup_date']).dt.strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Create a user-friendly selection format
+            backups['selection_label'] = backups.apply(
+                lambda x: f"{x['display_date']} ({x['backup_type_display']})", 
+                axis=1
+            )
+            
+            # Create a mapping of selection label to backup path
+            backup_mapping = dict(zip(backups['selection_label'], backups['backup_path']))
+            
+            # Let user select a backup
+            selected_backup_label = st.selectbox(
+                "Select a backup to restore",
+                options=list(backup_mapping.keys()),
+                key="restore_backup_select"
+            )
+            
+            selected_backup_path = backup_mapping[selected_backup_label]
+            
+            # Confirmation
+            if st.checkbox("I understand this will replace all current data with the selected backup's data.", key="confirm_restore"):
+                if st.button("Restore Selected Backup", key="btn_restore_backup"):
+                    result = restore_from_backup(selected_backup_path)
+                    
+                    if result is True:
+                        st.success("Database restored successfully! Reloading page...")
+                        time.sleep(2)
+                        st.rerun()
+                    else:
+                        st.error(f"Error restoring database: {result}")
+
+    with backup_tabs[2]:  # Backup History tab
+        backups = get_available_backups()
+        
+        if backups.empty:
+            st.info("No backup history available.")
+        else:
+            # Format the data for display
+            display_backups = backups[['backup_date', 'backup_type_display']].copy()
+            display_backups.columns = ['Backup Date', 'Type']
+            display_backups['Backup Date'] = pd.to_datetime(display_backups['Backup Date']).dt.strftime('%Y-%m-%d %H:%M:%S')
+            
+            st.write(f"Total Backups: {len(backups)}")
+            st.dataframe(display_backups)
 
     # Reset Database Section (Danger Zone)
     st.subheader("Reset Database")
     st.warning("⚠️ This will delete all data and reset the database to its initial state. Use with caution!")
     
-    if st.checkbox("I understand that this will delete all data and cannot be undone."):
-        if st.button("Reset Database"):
+    if st.checkbox("I understand that this will delete all data and cannot be undone.", key="confirm_reset_db"):
+        if st.button("Reset Database", key="btn_reset_db"):
+            # Create a backup before resetting
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            pre_reset_backup = f"backups/pre_reset_backup_{timestamp}.db"
+            
+            # Create backups directory if it doesn't exist
+            if not os.path.exists('backups'):
+                os.makedirs('backups')
+            
+            # Copy current database to backup
+            shutil.copy2('timesheet_data.db', pre_reset_backup)
+            
             conn = sqlite3.connect('timesheet_data.db')
             c = conn.cursor()
+            
+            # Log the backup
+            c.execute('''
+            CREATE TABLE IF NOT EXISTS backup_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                backup_date TIMESTAMP,
+                backup_path TEXT,
+                backup_type TEXT
+            )
+            ''')
+            
+            c.execute("""
+            INSERT INTO backup_logs (backup_date, backup_path, backup_type) 
+            VALUES (?, ?, ?)
+            """, (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), pre_reset_backup, 'pre-reset'))
             
             # Drop all tables
             c.execute("DROP TABLE IF EXISTS team_members")
@@ -1004,13 +1277,15 @@ with tabs[3]:  # Settings Tab
             c.execute("DROP TABLE IF EXISTS auth_settings")
             c.execute("DROP TABLE IF EXISTS app_settings")
             
-            # Reinitialize the database
-            init_db()
-            init_auth()
+            # Keep the backup_logs table
             
             conn.commit()
             conn.close()
             
-            st.success("Database has been reset to its initial state.")
+            # Reinitialize the database
+            init_db()
+            init_auth()
+            
+            st.success("Database has been reset to its initial state. A backup was created before reset.")
             time.sleep(2)  # Brief pause to show the success message
             st.rerun()  # Refresh the page to reflect changes
